@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: daytrack-chat
+    runtime: python
+    plan: free
+    autoDeploy: true
+    buildCommand: ""
+    startCommand: python chat_server.py
+    healthCheckPath: /api/chat/history
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: RENDER
+        value: "1"
+      - key: DAYTRACK_ORIGINS
+        value: "*"
