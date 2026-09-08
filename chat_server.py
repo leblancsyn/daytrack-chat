@@ -2,15 +2,21 @@
 import json
 import os
 import queue
+import secrets
 import threading
+import time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 PORT = int(os.environ.get("PORT", os.environ.get("DAYTRACK_PORT", "8123")))
 HISTORY_LIMIT = 200
 MESSAGE_MAX = 1000
 NICK_MAX = 24
+STORY_TTL = 24 * 60 * 60            # seconds
+STORY_TEXT_MAX = 500
+STORY_IMAGE_MAX = 700000            # base64 chars (~500 KB)
+STORIES_LIMIT = 200
 # Render-compatible host (0.0.0.0 works locally too)
 HOST = os.environ.get("HOST", "0.0.0.0")
 # Allow the app to call the chat server cross-origin
@@ -27,6 +33,8 @@ mutex = threading.Lock()
 clients = set()
 messages = []
 msg_counter = 0
+stories = []
+story_counter = 0
 
 
 def now_ts():
@@ -57,6 +65,52 @@ def add_message(nick, text):
     return msg
 
 
+def prune_stories():
+    global stories
+    cutoff = time.time() - STORY_TTL
+    stories = [s for s in stories if s["ts"] > cutoff]
+    if len(stories) > STORIES_LIMIT:
+        stories = stories[len(stories) - STORIES_LIMIT:]
+
+
+def add_story(nick, text, image):
+    global story_counter
+    with mutex:
+        prune_stories()
+        story = {
+            "id": story_counter,
+            "nick": nick,
+            "text": text,
+            "image": image,
+            "ts": int(time.time() * 1000),
+            "token": secrets.token_urlsafe(12),
+        }
+        story_counter += 1
+        stories.append(story)
+    return story
+
+
+def public_story(s):
+    return {"id": s["id"], "nick": s["nick"], "text": s["text"], "image": s["image"], "ts": s["ts"]}
+
+
+def delete_story(story_id, token):
+    with mutex:
+        prune_stories()
+        for i, s in enumerate(stories):
+            if s["id"] == story_id and s["token"] == token:
+                del stories[i]
+                return True
+    return False
+
+
+def prune_loop():
+    while True:
+        time.sleep(300)
+        with mutex:
+            prune_stories()
+
+
 def cors_origin(handler):
     origin = handler.headers.get("Origin")
     if not origin:
@@ -77,7 +131,7 @@ def send_json(handler, obj, code=200):
     if origin:
         handler.send_header("Access-Control-Allow-Origin", origin)
     if handler.command == "OPTIONS":
-        handler.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        handler.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
         handler.send_header(
             "Access-Control-Allow-Headers", "Content-Type"
         )
@@ -100,6 +154,9 @@ class Handler(BaseHTTPRequestHandler):
         if base == "/api/chat/history":
             self.handle_history()
             return
+        if base == "/api/stories":
+            self.handle_stories_get()
+            return
         if base.startswith("/api/"):
             send_json(self, {"error": "Not Found"}, 404)
             return
@@ -112,6 +169,24 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if urlparse(self.path).path == "/api/chat/send":
             self.handle_send()
+            return
+        if urlparse(self.path).path == "/api/stories":
+            self.handle_stories_post()
+            return
+        send_json(self, {"error": "Not Found"}, 404)
+
+    def do_DELETE(self):
+        if urlparse(self.path).path == "/api/stories":
+            params = parse_qs(urlparse(self.path).query)
+            try:
+                story_id = int(params.get("id", ["-1"])[0])
+            except ValueError:
+                story_id = -1
+            token = params.get("token", [""])[0]
+            if delete_story(story_id, token):
+                send_json(self, {"ok": True, "deleted": story_id})
+            else:
+                send_json(self, {"ok": False, "error": "Not found or not yours"}, 404)
             return
         send_json(self, {"error": "Not Found"}, 404)
 
@@ -173,6 +248,38 @@ class Handler(BaseHTTPRequestHandler):
         msg = add_message(nick, text)
         send_json(self, {"ok": True, "message": msg})
 
+    def handle_stories_get(self):
+        with mutex:
+            prune_stories()
+            out = [public_story(s) for s in reversed(stories)]
+        send_json(self, {"stories": out})
+
+    def handle_stories_post(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+        except Exception:
+            send_json(self, {"error": "Bad request"}, 400)
+            return
+        nick = str(body.get("nick", "")).strip()[:NICK_MAX]
+        text = str(body.get("text", "")).strip()[:STORY_TEXT_MAX]
+        image = body.get("image") or None
+        if image is not None and (
+            not isinstance(image, str) or not image.startswith("data:image/")
+        ):
+            image = None
+        if not nick:
+            send_json(self, {"error": "Missing nickname"}, 400)
+            return
+        if not text and not image:
+            send_json(self, {"error": "Add some text or a photo"}, 400)
+            return
+        if image and len(image) > STORY_IMAGE_MAX:
+            send_json(self, {"error": "Photo too large"}, 413)
+            return
+        story = add_story(nick, text, image)
+        send_json(self, {"ok": True, "story": story})
+
     def handle_stream(self):
         self.send_response(200)
         origin = cors_origin(self)
@@ -208,9 +315,10 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
-add_message("DayTrack", "Chat is live. Say hi to everyone!")
+add_message("DayTracker", "Chat is live. Say hi to everyone!")
 
 if __name__ == "__main__":
+    threading.Thread(target=prune_loop, daemon=True).start()
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"DayTrack server running on http://{HOST}:{PORT}")
     try:
